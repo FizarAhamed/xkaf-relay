@@ -90,19 +90,42 @@ async def handle_health(request):
         "notice": None if is_auth else "Telegram client not yet authorized. Please verify TELEGRAM_STRING_SESSION.",
     })
 
-def clean_token(raw_token):
-    if not raw_token:
-        return None
-    # If URL like https://api.xkaf.org/d/XYZ or https://t.me/xKAF_dl_bot?start=XYZ
-    match = re.search(r"start=([a-zA-Z0-9_\-]+)", raw_token)
-    if match:
-        return match.group(1)
-    match = re.search(r"/d/([a-zA-Z0-9_\-]+)", raw_token)
-    if match:
-        return match.group(1)
-    # Strip any extra query params or whitespace
-    raw_token = raw_token.strip().split("&")[0].split("?")[0]
-    return raw_token
+def parse_telegram_target(raw_input):
+    """
+    Parses any token, link, or URL into target type, bot/channel, and id/payload.
+    Supports:
+      - https://t.me/xkaf_bot?start=XYZ
+      - https://t.me/xKAF_dl_bot?start=XYZ
+      - https://t.me/xkaforg/123
+      - /d/XYZ or plain token string
+    """
+    if not raw_input:
+        return None, None, None
+    s = str(raw_input).strip()
+
+    # 1. Channel post: t.me/xkaforg/123
+    m_channel = re.search(r"t\.me/([a-zA-Z0-9_\-]+)/(\d+)", s)
+    if m_channel:
+        return "channel", m_channel.group(1), int(m_channel.group(2))
+
+    # 2. Bot start link: t.me/<bot>?start=<token>
+    m_bot = re.search(r"t\.me/([a-zA-Z0-9_\-]+)\?(?:start|startgroup)=([a-zA-Z0-9_\-]+)", s)
+    if m_bot:
+        return "bot", m_bot.group(1), m_bot.group(2)
+
+    # 3. Direct download path: /d/<token>
+    m_path = re.search(r"/d/([a-zA-Z0-9_\-]+)", s)
+    if m_path:
+        return "bot", "xkaf_bot", m_path.group(1)
+
+    # 4. Query param start=XYZ
+    m_start = re.search(r"start=([a-zA-Z0-9_\-]+)", s)
+    if m_start:
+        return "bot", "xkaf_bot", m_start.group(1)
+
+    # Plain token: default to active xkaf_bot
+    clean = s.split("&")[0].split("?")[0].strip()
+    return "bot", "xkaf_bot", clean
 
 async def handle_download(request):
     client = request.app.get("telegram_client")
@@ -115,11 +138,11 @@ async def handle_download(request):
 
     title = request.query.get("title", "book")
     ext = request.query.get("format", "epub").lower()
-    raw_token = request.query.get("token")
+    raw_input = request.query.get("url") or request.query.get("link") or request.query.get("token")
     msg_id = request.query.get("msg_id") or request.query.get("telegram_msg_id")
     channel = request.query.get("channel", "xkaforg")
 
-    # Priority 1: Direct fetch by Telegram Message ID (e.g. channel @xkaforg)
+    # If explicit msg_id provided, fetch directly from channel
     if msg_id:
         try:
             mid = int(str(msg_id).strip())
@@ -141,39 +164,61 @@ async def handle_download(request):
         except Exception as e:
             print(f"[!] Error fetching direct message {msg_id}: {e}")
 
-    # Priority 2: Minted token via @xKAF_dl_bot
-    token = clean_token(raw_token) if raw_token else None
-    if not token:
+    # Parse input link or token
+    target_type, target_name, payload = parse_telegram_target(raw_input)
+
+    if not target_type or not payload:
         return web.Response(
-            text=json.dumps({"error": "Missing valid download token or telegram_msg_id."}),
+            text=json.dumps({"error": "Missing valid Telegram link, token, or message ID."}),
             status=400,
             content_type="application/json"
         )
 
-    print(f"[*] Received download request for: '{title}' ({ext}) with token: {token}")
+    # If the link is a direct channel message (e.g. t.me/xkaforg/123)
+    if target_type == "channel":
+        try:
+            print(f"[*] Fetching from channel '{target_name}', msg_id {payload}...")
+            msg = await client.get_messages(target_name, ids=int(payload))
+            if msg and msg.file:
+                file_bytes = await client.download_media(msg, file=bytes)
+                if file_bytes:
+                    file_name = msg.file.name or f"{title}.{ext}"
+                    response = web.Response(body=file_bytes)
+                    response.content_type = "application/epub+zip" if ext == "epub" else "application/octet-stream"
+                    response.headers["Content-Disposition"] = f'attachment; filename="{file_name}"'
+                    response.headers["Content-Length"] = str(len(file_bytes))
+                    return response
+        except Exception as e:
+            print(f"[!] Error fetching channel message: {e}")
 
-    # Set up future for incoming document from @xKAF_dl_bot
+    # If the target is a bot (@xkaf_bot or @xKAF_dl_bot)
+    bot_username = target_name or "xkaf_bot"
+    token = str(payload).strip()
+    print(f"[*] Received download request for: '{title}' ({ext}) via @{bot_username} with token: {token}")
+
     loop = asyncio.get_running_loop()
     doc_future = loop.create_future()
 
-    @client.on(events.NewMessage(chats="xKAF_dl_bot"))
+    # Listen for replies from active xkaf_bot as well as legacy xKAF_dl_bot
+    allowed_chats = list(set([bot_username, "xkaf_bot", "xKAF_dl_bot"]))
+
+    @client.on(events.NewMessage(chats=allowed_chats))
     async def handler(event):
         if event.message and event.message.file:
-            print(f"[+] Received book file from @xKAF_dl_bot: {event.message.file.name}")
+            print(f"[+] Received book file from Telegram: {event.message.file.name}")
             if not doc_future.done():
                 doc_future.set_result(event.message)
 
     try:
-        # Send /start <token> to @xKAF_dl_bot
-        print(f"[*] Sending '/start {token}' to @xKAF_dl_bot...")
-        await client.send_message("xKAF_dl_bot", f"/start {token}")
+        print(f"[*] Sending '/start {token}' to @{bot_username}...")
+        await client.send_message(bot_username, f"/start {token}")
 
         # Wait for file with 45s timeout
         msg = await asyncio.wait_for(doc_future, timeout=45.0)
     except asyncio.TimeoutError:
-        print("[!] Timeout waiting for @xKAF_dl_bot to deliver file.")
+        print(f"[!] Timeout waiting for @{bot_username} to deliver file.")
         return web.Response(
-            text=json.dumps({"error": "Timeout waiting for @xKAF_dl_bot to respond."}),
+            text=json.dumps({"error": f"Timeout waiting for @{bot_username} to respond."}),
             status=504,
             content_type="application/json"
         )
