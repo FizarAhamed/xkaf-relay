@@ -2,11 +2,15 @@ FROM python:3.11-slim
 
 WORKDIR /app
 
+# Prevent Python from writing pyc files and buffering stdout/stderr
+ENV PYTHONDONTWRITEBYTECODE=1
+ENV PYTHONUNBUFFERED=1
+
+# Install dependencies directly
 RUN pip install --no-cache-dir telethon aiohttp
 
+# Copy application script
 COPY xkaf_telegram_relay.py .
-COPY xkaf_relay_config.json* .
-COPY xkaf_user.session* .
 
 EXPOSE 8080
 
