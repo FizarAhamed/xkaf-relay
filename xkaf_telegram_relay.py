@@ -288,7 +288,10 @@ def parse_telegram_target(raw_input, default_bot="xkaf_bot"):
     # 2. Bot start link: t.me/<bot>?start=<token>
     m_bot = re.search(r"t\.me/([a-zA-Z0-9_\-]+)\?(?:start|startgroup)=([a-zA-Z0-9_\-]+)", s)
     if m_bot:
-        return "bot", m_bot.group(1), m_bot.group(2)
+        bot_target = m_bot.group(1)
+        if bot_target.lower() == "xkaf_bot":
+            bot_target = "xKAF_dl_bot"
+        return "bot", bot_target, m_bot.group(2)
 
     # 3. Direct download path: /d/<token>
     m_path = re.search(r"/d/([a-zA-Z0-9_\-]+)", s)
@@ -500,8 +503,10 @@ async def handle_download(request):
             content_type="application/json"
         )
 
-    # Determine primary bot
+    # Determine primary bot (always xKAF_dl_bot for file downloads)
     bot_username = target_name or default_bot
+    if bot_username.lower() == "xkaf_bot":
+        bot_username = "xKAF_dl_bot"
     token = str(payload).strip()
     print(f"[*] Forwarding to Telegram: '{title}' ({ext}) via @{bot_username} (is_raw={is_raw_book}) with token: {token}")
 
