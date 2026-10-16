@@ -5,7 +5,9 @@ xKAF Telegram MTProto Relay & 24/7 Session Keeper for KOReader
 1. Connects personal Telegram account to @xkaf_bot / @xKAF_dl_bot via MTProto (Telethon).
 2. Maintains 24/7 authenticated xKAF session via automatic refresh token rotation (every 7 minutes).
 3. Mints signed download tokens for Curated & 324k Global Archive books on demand.
-4. Streams binary EPUB, MOBI, and PDF book files directly back to Kindle over Wi-Fi.
+4. Correctly routes Global Archive downloads to @xKAF_dl_bot and Curated to @xkaf_bot.
+5. Ignores welcome photos/banners and ONLY captures real book documents (.epub, .pdf, .mobi).
+6. Streams binary book files directly back to Kindle over Wi-Fi.
 """
 
 import os
@@ -138,17 +140,14 @@ async def refresh_xkaf_session():
                 raw_text = await resp.text()
 
                 if status == 200:
-                    # Parse new rotated tokens from Set-Cookie headers
                     new_at = None
                     new_rt = None
 
-                    # aiohttp parses cookies into SimpleCookie
                     if "xkaf_at" in resp.cookies:
                         new_at = resp.cookies["xkaf_at"].value
                     if "xkaf_rt" in resp.cookies:
                         new_rt = resp.cookies["xkaf_rt"].value
 
-                    # Fallback regex if cookie jar didn't catch path-restricted cookies
                     for header_val in resp.headers.getall("Set-Cookie", []):
                         m_at = re.search(r"xkaf_at=([^;,\s]+)", header_val)
                         if m_at and m_at.group(1) != "deleted":
@@ -188,7 +187,6 @@ async def refresh_xkaf_session():
 async def mint_xkaf_token(raw_id=None, slug=None, msg_id=None, ext="epub"):
     """Mints a signed 5-minute download token for raw or curated books."""
     if not xkaf_state.get("at"):
-        # Attempt immediate refresh
         ok, _ = await refresh_xkaf_session()
         if not ok or not xkaf_state.get("at"):
             return None, "xKAF session not active or expired. Please visit /set-session?rt=..."
@@ -267,10 +265,9 @@ async def session_keeper_loop():
                 xkaf_state["status"] = "waiting_for_token"
         except Exception as e:
             print(f"[!] Session keeper error: {e}")
-        # Wait 7 minutes (420s) before next rotation
         await asyncio.sleep(420)
 
-def parse_telegram_target(raw_input):
+def parse_telegram_target(raw_input, default_bot="xkaf_bot"):
     """
     Parses any token, link, or URL into target type, bot/channel, and id/payload.
     Supports:
@@ -296,16 +293,16 @@ def parse_telegram_target(raw_input):
     # 3. Direct download path: /d/<token>
     m_path = re.search(r"/d/([a-zA-Z0-9_\-]+)", s)
     if m_path:
-        return "bot", "xkaf_bot", m_path.group(1)
+        return "bot", default_bot, m_path.group(1)
 
     # 4. Query param start=XYZ
     m_start = re.search(r"start=([a-zA-Z0-9_\-]+)", s)
     if m_start:
-        return "bot", "xkaf_bot", m_start.group(1)
+        return "bot", default_bot, m_start.group(1)
 
-    # Plain token: default to active xkaf_bot
+    # Plain token: use default_bot
     clean = s.split("&")[0].split("?")[0].strip()
-    return "bot", "xkaf_bot", clean
+    return "bot", default_bot, clean
 
 async def handle_health(request):
     client = request.app.get("telegram_client")
@@ -337,6 +334,10 @@ async def handle_health(request):
             "last_refresh_ago": f"{age_seconds}s" if age_seconds is not None else "never",
             "last_error": xkaf_state["last_error"],
         },
+        "bots": {
+            "global_archive": "@xKAF_dl_bot",
+            "curated_library": "@xkaf_bot",
+        },
         "service": "xkaf-telegram-relay",
         "notice": None if is_auth else "Telegram client not yet authorized. Please verify TELEGRAM_STRING_SESSION.",
     })
@@ -357,7 +358,6 @@ async def handle_set_session(request):
             "current_status": xkaf_state["status"]
         }, status=400)
 
-    # Clean token string
     clean_rt = rt.strip().strip('"\'')
     if "xkaf_rt=" in clean_rt:
         m = re.search(r"xkaf_rt=([^;,\s]+)", clean_rt)
@@ -376,6 +376,46 @@ async def handle_set_session(request):
         "rotation_interval": "every 7 minutes automatically",
     })
 
+async def handle_test_mint(request):
+    """Diagnostic endpoint to inspect mint-token responses."""
+    raw_id = request.query.get("raw_id")
+    slug = request.query.get("slug")
+    msg_id = request.query.get("msg_id", 0)
+    ext = request.query.get("format", "epub")
+
+    url, err = await mint_xkaf_token(raw_id=raw_id, slug=slug, msg_id=msg_id, ext=ext)
+    return web.json_response({
+        "raw_id": raw_id,
+        "slug": slug,
+        "minted_url": url,
+        "error": err,
+    })
+
+async def handle_recent_messages(request):
+    """Inspects recent messages in bot chats for debugging."""
+    client = request.app.get("telegram_client")
+    if not client or not await client.is_user_authorized():
+        return web.json_response({"error": "Telegram client not authorized."}, status=401)
+
+    bot = request.query.get("bot", "xKAF_dl_bot")
+    try:
+        msgs = await client.get_messages(bot, limit=5)
+        res = []
+        for m in msgs:
+            res.append({
+                "id": m.id,
+                "date": str(m.date),
+                "is_photo": bool(m.photo),
+                "is_document": bool(m.document),
+                "file_name": m.file.name if m.file else None,
+                "file_size": m.file.size if m.file else None,
+                "mime_type": getattr(m.file, "mime_type", None) if m.file else None,
+                "text": m.text,
+            })
+        return web.json_response({"bot": bot, "messages": res})
+    except Exception as e:
+        return web.json_response({"error": str(e)}, status=500)
+
 async def handle_download(request):
     client = request.app.get("telegram_client")
     if not client or not await client.is_user_authorized():
@@ -393,12 +433,17 @@ async def handle_download(request):
     slug = request.query.get("slug")
     channel = request.query.get("channel", "xkaforg")
 
+    is_raw_book = bool(raw_id)
+    # Global Archive uses @xKAF_dl_bot; Curated Library uses @xkaf_bot
+    default_bot = "xKAF_dl_bot" if is_raw_book else "xkaf_bot"
+
     # 1. If raw_id is passed, mint token using our 24/7 server session
     if raw_id:
         print(f"[*] Download request for Global Archive rawId: {raw_id} ('{title}')")
         minted_url, err = await mint_xkaf_token(raw_id=raw_id, ext=ext)
         if minted_url:
             raw_input = minted_url
+            print(f"[+] Global Archive minted URL: {minted_url}")
         else:
             return web.Response(
                 text=json.dumps({"error": f"Failed to mint download token for rawId #{raw_id}: {err}"}),
@@ -426,7 +471,7 @@ async def handle_download(request):
             if mid > 0:
                 print(f"[*] Direct Telegram fetch: channel '{channel}', msg_id {mid} for '{title}' ({ext})")
                 msg = await client.get_messages(channel, ids=mid)
-                if msg and msg.file:
+                if msg and msg.file and msg.document:
                     file_bytes = await client.download_media(msg, file=bytes)
                     if file_bytes:
                         file_name = msg.file.name or f"{title}.{ext}"
@@ -446,8 +491,8 @@ async def handle_download(request):
             if minted_url:
                 raw_input = minted_url
 
-    # Parse input link or token
-    target_type, target_name, payload = parse_telegram_target(raw_input)
+    # Parse input link or token with appropriate default bot
+    target_type, target_name, payload = parse_telegram_target(raw_input, default_bot=default_bot)
 
     if not target_type or not payload:
         return web.Response(
@@ -456,34 +501,62 @@ async def handle_download(request):
             content_type="application/json"
         )
 
-    # If the target is a bot (@xkaf_bot or @xKAF_dl_bot)
-    bot_username = target_name or "xkaf_bot"
+    # Determine primary bot
+    bot_username = target_name or default_bot
     token = str(payload).strip()
-    print(f"[*] Forwarding to Telegram: '{title}' ({ext}) via @{bot_username} with token: {token}")
+    print(f"[*] Forwarding to Telegram: '{title}' ({ext}) via @{bot_username} (is_raw={is_raw_book}) with token: {token}")
 
     loop = asyncio.get_running_loop()
     doc_future = loop.create_future()
+    last_bot_text = []
 
-    # Listen for replies from active xkaf_bot as well as legacy xKAF_dl_bot
-    allowed_chats = list(set([bot_username, "xkaf_bot", "xKAF_dl_bot"]))
+    # Listen for replies from BOTH bots
+    allowed_chats = ["xKAF_dl_bot", "xkaf_bot"]
 
     @client.on(events.NewMessage(chats=allowed_chats))
     async def handler(event):
-        if event.message and event.message.file:
-            print(f"[+] Received book file from Telegram: {event.message.file.name}")
-            if not doc_future.done():
-                doc_future.set_result(event.message)
+        if not event.message:
+            return
+
+        sender_chat = getattr(event.chat, "username", "") or str(event.chat_id)
+        if event.message.text:
+            print(f"[*] Bot @{sender_chat} sent text: {event.message.text[:120]}")
+            last_bot_text.append(event.message.text)
+
+        # CRITICAL FIX: Only accept DOCUMENTS (not welcome photos, banners, or avatars!)
+        if event.message.document:
+            mime = getattr(event.message.file, "mime_type", "") or ""
+            file_name = event.message.file.name or ""
+            # Reject image/jpeg or image/png banner documents unless filename is explicit book format
+            is_image = mime.startswith("image/") and not file_name.lower().endswith((".epub", ".pdf", ".mobi", ".azw3", ".cbz"))
+            if not is_image:
+                print(f"[+] Received valid book document from @{sender_chat}: '{file_name}' ({mime}, {event.message.file.size} bytes)")
+                if not doc_future.done():
+                    doc_future.set_result(event.message)
+            else:
+                print(f"[-] Ignored banner image document from @{sender_chat}: '{file_name}' ({mime})")
+        elif event.message.photo:
+            print(f"[-] Ignored bot welcome photo from @{sender_chat} ({event.message.file.size if event.message.file else 0} bytes). Waiting for book document...")
 
     try:
-        print(f"[*] Sending '/start {token}' to @{bot_username}...")
+        # Send /start {token} to primary bot
+        print(f"[*] Sending '/start {token}' to primary bot @{bot_username}...")
         await client.send_message(bot_username, f"/start {token}")
+
+        # For raw books, if primary was not xKAF_dl_bot, also send to xKAF_dl_bot
+        if is_raw_book and bot_username != "xKAF_dl_bot":
+            print(f"[*] Also sending '/start {token}' to @xKAF_dl_bot...")
+            await client.send_message("xKAF_dl_bot", f"/start {token}")
 
         # Wait for file with 45s timeout
         msg = await asyncio.wait_for(doc_future, timeout=45.0)
     except asyncio.TimeoutError:
-        print(f"[!] Timeout waiting for @{bot_username} to deliver file.")
+        print(f"[!] Timeout waiting for @{bot_username} to deliver book document.")
+        err_msg = f"Timeout waiting for book document from @{bot_username}."
+        if last_bot_text:
+            err_msg += f" Bot response: {last_bot_text[-1][:150]}"
         return web.Response(
-            text=json.dumps({"error": f"Timeout waiting for @{bot_username} to respond."}),
+            text=json.dumps({"error": err_msg}),
             status=504,
             content_type="application/json"
         )
@@ -498,7 +571,7 @@ async def handle_download(request):
         client.remove_event_handler(handler)
 
     # Download file bytes into buffer
-    print("[*] Downloading file bytes from Telegram...")
+    print(f"[*] Downloading book bytes from Telegram ({msg.file.size} bytes)...")
     file_bytes = await client.download_media(msg, file=bytes)
     if not file_bytes:
         return web.Response(
@@ -555,6 +628,8 @@ async def init_app():
     app.router.add_get("/download", handle_download)
     app.router.add_get("/set-session", handle_set_session)
     app.router.add_post("/set-session", handle_set_session)
+    app.router.add_get("/test-mint", handle_test_mint)
+    app.router.add_get("/recent-messages", handle_recent_messages)
     app.router.add_post("/notify", handle_notify)
     app.router.add_get("/notify", handle_notify)
     return app
@@ -585,7 +660,6 @@ async def main():
     cfg = load_config()
     port = int(cfg.get("port", 8080))
 
-    # Load initial session from disk or env
     load_cached_session()
 
     # 1. Start the HTTP web server FIRST
