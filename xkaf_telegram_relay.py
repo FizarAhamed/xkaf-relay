@@ -6,13 +6,10 @@ This server connects your personal Telegram user account directly to @xKAF_dl_bo
 via Telegram's MTProto protocol (using Telethon).
 
 When KOReader on your Kindle requests a book download:
-1. KOReader calls this relay: http://<PC_IP>:8080/download?token=<TOKEN>
+1. KOReader calls this relay: https://<back4app-url>/download?token=<TOKEN>
 2. The relay sends `/start <TOKEN>` to @xKAF_dl_bot from your Telegram account.
 3. @xKAF_dl_bot sends back the EPUB/MOBI file.
-4. The relay streams the binary file directly back to your Kindle over Wi-Fi!
-
-Requirements:
-    pip install telethon aiohttp
+4. The relay streams the binary file directly back to your Kindle!
 """
 
 import os
@@ -28,38 +25,69 @@ CONFIG_FILE = os.path.join(os.path.dirname(os.path.abspath(__file__)), "xkaf_rel
 SESSION_FILE = os.path.join(os.path.dirname(os.path.abspath(__file__)), "xkaf_user")
 
 def load_config():
-    cfg = {}
+    cfg = {
+        "api_id": 2040,
+        "api_hash": "b1844f7ea357e827e322493d1b02dd59",
+        "port": 8080,
+    }
     if os.path.exists(CONFIG_FILE):
         try:
             with open(CONFIG_FILE, "r", encoding="utf-8") as f:
-                cfg = json.load(f)
+                cfg.update(json.load(f))
         except Exception as e:
-            print(f"[!] Error reading config: {e}")
+            print(f"[!] Error reading config file: {e}")
     # Environment variables override config file
     if os.environ.get("TELEGRAM_API_ID"):
-        cfg["api_id"] = int(os.environ["TELEGRAM_API_ID"])
+        try:
+            cfg["api_id"] = int(os.environ["TELEGRAM_API_ID"])
+        except ValueError:
+            pass
     if os.environ.get("TELEGRAM_API_HASH"):
-        cfg["api_hash"] = os.environ["TELEGRAM_API_HASH"]
+        cfg["api_hash"] = os.environ["TELEGRAM_API_HASH"].strip().strip('"\'')
     if os.environ.get("TELEGRAM_STRING_SESSION"):
         cfg["string_session"] = os.environ["TELEGRAM_STRING_SESSION"]
     if os.environ.get("PORT"):
-        cfg["port"] = int(os.environ["PORT"])
+        try:
+            cfg["port"] = int(os.environ["PORT"])
+        except ValueError:
+            pass
     return cfg
 
-def save_config(cfg):
-    with open(CONFIG_FILE, "w", encoding="utf-8") as f:
-        json.dump(cfg, f, indent=4)
+def sanitize_string_session(s):
+    if not s:
+        return None
+    s = s.strip().strip('"\'').strip()
+    if not s:
+        return None
+    # Fix base64 padding if needed
+    if len(s) > 1 and s.startswith("1"):
+        payload = s[1:]
+        missing = len(payload) % 4
+        if missing:
+            payload += "=" * (4 - missing)
+        return s[0] + payload
+    return s
 
 async def handle_health(request):
-    client = request.app["telegram_client"]
-    is_auth = await client.is_user_authorized() if client else False
-    me = await client.get_me() if is_auth else None
+    client = request.app.get("telegram_client")
+    is_auth = False
+    me = None
+    if client:
+        try:
+            is_auth = await client.is_user_authorized()
+            if is_auth:
+                me = await client.get_me()
+        except Exception as e:
+            print(f"[!] Error checking client authorization: {e}")
+
     return web.json_response({
-        "status": "ok",
+        "status": "ok" if is_auth else "warning",
         "authorized": is_auth,
         "user": me.first_name if me else None,
         "username": me.username if me else None,
         "phone": me.phone if me else None,
+        "service": "xkaf-telegram-relay",
+        "notice": None if is_auth else "Telegram client not yet authorized. Please verify TELEGRAM_STRING_SESSION.",
     })
 
 def clean_token(raw_token):
@@ -77,10 +105,10 @@ def clean_token(raw_token):
     return raw_token
 
 async def handle_download(request):
-    client = request.app["telegram_client"]
+    client = request.app.get("telegram_client")
     if not client or not await client.is_user_authorized():
         return web.Response(
-            text=json.dumps({"error": "Telegram client not authorized. Please run setup first."}),
+            text=json.dumps({"error": "Telegram client not authorized. Please configure TELEGRAM_STRING_SESSION."}),
             status=401,
             content_type="application/json"
         )
@@ -147,16 +175,6 @@ async def handle_download(request):
     file_name = msg.file.name or f"{title}.{ext}"
     print(f"[+] Successfully retrieved '{file_name}' ({len(file_bytes)} bytes). Streaming to Kindle...")
 
-    # Optional: Forward to personal bot if configured
-    cfg = load_config()
-    bot_token = cfg.get("personal_bot_token")
-    if bot_token and cfg.get("forward_to_bot", False):
-        try:
-            print("[*] Also forwarding copy to your personal bot...")
-            await client.forward_messages(cfg.get("user_id"), msg)
-        except Exception as e:
-            print(f"[!] Forwarding error (non-fatal): {e}")
-
     # Stream back directly to Kindle
     response = web.Response(body=file_bytes)
     response.content_type = "application/epub+zip" if ext == "epub" else "application/octet-stream"
@@ -164,9 +182,8 @@ async def handle_download(request):
     response.headers["Content-Length"] = str(len(file_bytes))
     return response
 
-async def init_app(client):
+async def init_app():
     app = web.Application()
-    app["telegram_client"] = client
     app.router.add_get("/", handle_health)
     app.router.add_get("/health", handle_health)
     app.router.add_get("/download", handle_download)
@@ -178,7 +195,7 @@ async def interactive_login(client):
         print("\n" + "="*50)
         print("  xKAF Telegram Relay - First Time Login")
         print("="*50)
-        phone = input("Enter your phone number (with country code, e.g. +8801712345678): ").strip()
+        phone = input("Enter your phone number (with country code, e.g. +88017...): ").strip()
         await client.send_code_request(phone)
         code = input("Enter the login code sent to your Telegram app: ").strip()
         try:
@@ -196,55 +213,52 @@ async def interactive_login(client):
 
 async def main():
     cfg = load_config()
-    api_id = cfg.get("api_id")
-    api_hash = cfg.get("api_hash")
+    port = int(cfg.get("port", 8080))
 
-    if not api_id or not api_hash:
-        print("\n" + "="*60)
-        print("  Missing Telegram API credentials!")
-        print("  Please obtain them free from https://my.telegram.org:")
-        print("  1. Log in with your phone number.")
-        print("  2. Click 'API development tools'.")
-        print("  3. Create an app (any title, e.g. 'KindleRelay').")
-        print("  4. Copy 'api_id' (numbers) and 'api_hash' (string).")
-        print("="*60 + "\n")
-        try:
-            api_id = input("Enter API ID: ").strip()
-            api_hash = input("Enter API HASH: ").strip()
-            cfg["api_id"] = int(api_id)
-            cfg["api_hash"] = api_hash
-            save_config(cfg)
-        except (KeyboardInterrupt, EOFError):
-            print("\nAborted.")
-            sys.exit(1)
-
-    string_sess = cfg.get("string_session")
-    if string_sess:
-        print("[*] Initializing Telegram client via TELEGRAM_STRING_SESSION (Cloud Mode)...")
-        session = StringSession(string_sess)
-        client = TelegramClient(session, int(cfg["api_id"]), cfg["api_hash"])
-        await client.connect()
-        me = await client.get_me()
-        print(f"[+] Authorized as {me.first_name} (@{me.username or me.phone})")
-    else:
-        session = SESSION_FILE
-        client = TelegramClient(session, int(cfg["api_id"]), cfg["api_hash"])
-        await interactive_login(client)
-
-    app = await init_app(client)
+    # 1. Start the HTTP web server FIRST so container health checks always pass
+    app = await init_app()
     runner = web.AppRunner(app)
     await runner.setup()
-    port = int(cfg.get("port", 8080))
     site = web.TCPSite(runner, "0.0.0.0", port)
     await site.start()
 
     print("\n" + "="*60)
-    print(f"  xKAF Telegram Relay is RUNNING on port {port}!")
-    print(f"  Health Check: http://127.0.0.1:{port}/health")
-    print(f"  Local Network: http://192.168.0.116:{port}/download?token=...")
+    print(f"  xKAF Telegram Relay web server listening on port {port}!")
+    print(f"  Health Check: http://0.0.0.0:{port}/health")
     print("="*60 + "\n")
 
-    # Keep running forever
+    # 2. Connect Telegram Client
+    client = None
+    string_sess = cfg.get("string_session")
+    if string_sess:
+        sanitized = sanitize_string_session(string_sess)
+        try:
+            print("[*] Initializing Telegram client via TELEGRAM_STRING_SESSION...")
+            session = StringSession(sanitized)
+            client = TelegramClient(session, int(cfg.get("api_id", 2040)), str(cfg.get("api_hash", "b1844f7ea357e827e322493d1b02dd59")))
+            await client.connect()
+            if await client.is_user_authorized():
+                me = await client.get_me()
+                print(f"[+] Authorized as {me.first_name} (@{me.username or me.phone})")
+            else:
+                print("[!] Warning: StringSession connected, but user is not authorized. Please check your session token.")
+        except Exception as e:
+            print(f"[!] Warning: Could not initialize Telegram client: {e}")
+            client = None
+    elif sys.stdin and sys.stdin.isatty():
+        try:
+            session = SESSION_FILE
+            client = TelegramClient(session, int(cfg.get("api_id", 2040)), str(cfg.get("api_hash", "b1844f7ea357e827e322493d1b02dd59")))
+            await interactive_login(client)
+        except Exception as e:
+            print(f"[!] Interactive login failed: {e}")
+            client = None
+    else:
+        print("[!] No TELEGRAM_STRING_SESSION provided in environment variables.")
+
+    app["telegram_client"] = client
+
+    # Keep server running forever
     while True:
         await asyncio.sleep(3600)
 
