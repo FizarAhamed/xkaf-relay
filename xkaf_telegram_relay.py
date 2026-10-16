@@ -338,9 +338,9 @@ async def handle_health(request):
             "last_error": xkaf_state["last_error"],
         },
         "bots": {
-            "global_archive": "@xKAF_dl_bot",
-            "curated_library": "@xkaf_bot",
+            "all_downloads": "@xKAF_dl_bot",
         },
+        "version": "1.3.0-dlbot-fix",
         "service": "xkaf-telegram-relay",
         "notice": None if is_auth else "Telegram client not yet authorized. Please verify TELEGRAM_STRING_SESSION.",
     })
