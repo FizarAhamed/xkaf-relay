@@ -113,14 +113,39 @@ async def handle_download(request):
             content_type="application/json"
         )
 
-    raw_token = request.query.get("token")
     title = request.query.get("title", "book")
     ext = request.query.get("format", "epub").lower()
+    raw_token = request.query.get("token")
+    msg_id = request.query.get("msg_id") or request.query.get("telegram_msg_id")
+    channel = request.query.get("channel", "xkaforg")
 
-    token = clean_token(raw_token)
+    # Priority 1: Direct fetch by Telegram Message ID (e.g. channel @xkaforg)
+    if msg_id:
+        try:
+            mid = int(str(msg_id).strip())
+            print(f"[*] Direct Telegram fetch: channel '{channel}', msg_id {mid} for '{title}' ({ext})")
+            msg = await client.get_messages(channel, ids=mid)
+            if msg and msg.file:
+                print(f"[+] Found document in {channel}/{mid}: {msg.file.name}")
+                file_bytes = await client.download_media(msg, file=bytes)
+                if file_bytes:
+                    file_name = msg.file.name or f"{title}.{ext}"
+                    print(f"[+] Streamed '{file_name}' ({len(file_bytes)} bytes) directly to client.")
+                    response = web.Response(body=file_bytes)
+                    response.content_type = "application/epub+zip" if ext == "epub" else "application/octet-stream"
+                    response.headers["Content-Disposition"] = f'attachment; filename="{file_name}"'
+                    response.headers["Content-Length"] = str(len(file_bytes))
+                    return response
+            else:
+                print(f"[!] Message {mid} in {channel} has no document attached.")
+        except Exception as e:
+            print(f"[!] Error fetching direct message {msg_id}: {e}")
+
+    # Priority 2: Minted token via @xKAF_dl_bot
+    token = clean_token(raw_token) if raw_token else None
     if not token:
         return web.Response(
-            text=json.dumps({"error": "Missing or invalid download token."}),
+            text=json.dumps({"error": "Missing valid download token or telegram_msg_id."}),
             status=400,
             content_type="application/json"
         )
