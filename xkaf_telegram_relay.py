@@ -436,6 +436,7 @@ async def handle_download(request):
     slug = request.query.get("slug")
     channel = request.query.get("channel", "xkaforg")
 
+    is_raw_book = bool(raw_id)
     # @xKAF_dl_bot is the real download delivery bot for both Curated and Global Archive
     default_bot = "xKAF_dl_bot"
 
@@ -454,11 +455,12 @@ async def handle_download(request):
             )
 
     # 2. If slug is passed without explicit token/url, mint token using our 24/7 server session
-    elif slug and not raw_input and (not msg_id or msg_id == "0"):
+    elif slug and not raw_input:
         print(f"[*] Download request for curated slug: {slug} ('{title}')")
         minted_url, err = await mint_xkaf_token(slug=slug, msg_id=msg_id, ext=ext)
         if minted_url:
             raw_input = minted_url
+            print(f"[+] Curated book minted URL: {minted_url}")
         else:
             return web.Response(
                 text=json.dumps({"error": f"Failed to mint download token for slug '{slug}': {err}"}),
