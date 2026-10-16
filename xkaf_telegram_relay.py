@@ -1,28 +1,39 @@
 #!/usr/bin/env python3
 """
-xKAF Telegram MTProto Relay for KOReader
-========================================
-This server connects your personal Telegram user account directly to @xKAF_dl_bot
-via Telegram's MTProto protocol (using Telethon).
-
-When KOReader on your Kindle requests a book download:
-1. KOReader calls this relay: https://<back4app-url>/download?token=<TOKEN>
-2. The relay sends `/start <TOKEN>` to @xKAF_dl_bot from your Telegram account.
-3. @xKAF_dl_bot sends back the EPUB/MOBI file.
-4. The relay streams the binary file directly back to your Kindle!
+xKAF Telegram MTProto Relay & 24/7 Session Keeper for KOReader
+=============================================================
+1. Connects personal Telegram account to @xkaf_bot / @xKAF_dl_bot via MTProto (Telethon).
+2. Maintains 24/7 authenticated xKAF session via automatic refresh token rotation (every 7 minutes).
+3. Mints signed download tokens for Curated & 324k Global Archive books on demand.
+4. Streams binary EPUB, MOBI, and PDF book files directly back to Kindle over Wi-Fi.
 """
 
 import os
 import sys
 import json
+import time
 import asyncio
 import re
-from aiohttp import web
+from aiohttp import web, ClientSession
 from telethon import TelegramClient, events
 from telethon.sessions import StringSession
 
 CONFIG_FILE = os.path.join(os.path.dirname(os.path.abspath(__file__)), "xkaf_relay_config.json")
 SESSION_FILE = os.path.join(os.path.dirname(os.path.abspath(__file__)), "xkaf_user")
+SESSION_CACHE_FILE = os.path.join(os.path.dirname(os.path.abspath(__file__)), "xkaf_session_cache.json")
+
+USER_AGENT = "Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/128.0.0.0 Safari/537.36"
+API_BASE = "https://api.xkaf.org"
+
+# In-memory xKAF session store
+xkaf_state = {
+    "rt": None,
+    "at": None,
+    "last_refresh": 0,
+    "status": "uninitialized",
+    "last_error": None,
+    "user_info": None,
+}
 
 def load_config():
     cfg = {
@@ -36,7 +47,6 @@ def load_config():
                 cfg.update(json.load(f))
         except Exception as e:
             print(f"[!] Error reading config file: {e}")
-    # Environment variables override config file
     if os.environ.get("TELEGRAM_API_ID"):
         try:
             cfg["api_id"] = int(os.environ["TELEGRAM_API_ID"])
@@ -59,7 +69,6 @@ def sanitize_string_session(s):
     s = s.strip().strip('"\'').strip()
     if not s:
         return None
-    # Fix base64 padding if needed
     if len(s) > 1 and s.startswith("1"):
         payload = s[1:]
         missing = len(payload) % 4
@@ -68,27 +77,198 @@ def sanitize_string_session(s):
         return s[0] + payload
     return s
 
-async def handle_health(request):
-    client = request.app.get("telegram_client")
-    is_auth = False
-    me = None
-    if client:
-        try:
-            is_auth = await client.is_user_authorized()
-            if is_auth:
-                me = await client.get_me()
-        except Exception as e:
-            print(f"[!] Error checking client authorization: {e}")
+def load_cached_session():
+    # 1. Environment variable takes highest initial priority
+    env_rt = os.environ.get("XKAF_REFRESH_TOKEN")
+    if env_rt:
+        xkaf_state["rt"] = env_rt.strip()
+        xkaf_state["status"] = "configured_via_env"
+        print("[*] Loaded xKAF refresh token from environment variable XKAF_REFRESH_TOKEN.")
 
-    return web.json_response({
-        "status": "ok" if is_auth else "warning",
-        "authorized": is_auth,
-        "user": me.first_name if me else None,
-        "username": me.username if me else None,
-        "phone": me.phone if me else None,
-        "service": "xkaf-telegram-relay",
-        "notice": None if is_auth else "Telegram client not yet authorized. Please verify TELEGRAM_STRING_SESSION.",
-    })
+    # 2. Check cached file on disk (persists across rotations)
+    if os.path.exists(SESSION_CACHE_FILE):
+        try:
+            with open(SESSION_CACHE_FILE, "r", encoding="utf-8") as f:
+                data = json.load(f)
+                if data.get("rt"):
+                    xkaf_state["rt"] = data["rt"]
+                if data.get("at"):
+                    xkaf_state["at"] = data["at"]
+                if data.get("last_refresh"):
+                    xkaf_state["last_refresh"] = data["last_refresh"]
+                if data.get("status"):
+                    xkaf_state["status"] = data["status"]
+                print("[*] Loaded cached xKAF session from disk.")
+        except Exception as e:
+            print(f"[!] Error reading session cache: {e}")
+
+def save_cached_session():
+    try:
+        with open(SESSION_CACHE_FILE, "w", encoding="utf-8") as f:
+            json.dump({
+                "rt": xkaf_state["rt"],
+                "at": xkaf_state["at"],
+                "last_refresh": xkaf_state["last_refresh"],
+                "status": xkaf_state["status"],
+            }, f, indent=2)
+    except Exception as e:
+        print(f"[!] Error saving session cache: {e}")
+
+async def refresh_xkaf_session():
+    """Refreshes xkaf_at and rotates xkaf_rt using https://api.xkaf.org/api/auth/refresh"""
+    rt = xkaf_state.get("rt")
+    if not rt:
+        xkaf_state["status"] = "no_token"
+        return False, "No refresh token configured."
+
+    print(f"[*] Attempting xKAF token refresh (current rt: {rt[:8]}...)...")
+    headers = {
+        "User-Agent": USER_AGENT,
+        "Referer": "https://xkaf.org/",
+        "Origin": "https://xkaf.org",
+        "Accept": "application/json, text/plain, */*",
+        "Accept-Encoding": "gzip, deflate",
+        "Cookie": f"xkaf_rt={rt}",
+    }
+
+    try:
+        async with ClientSession() as session:
+            async with session.post(f"{API_BASE}/api/auth/refresh", headers=headers) as resp:
+                status = resp.status
+                raw_text = await resp.text()
+
+                if status == 200:
+                    # Parse new rotated tokens from Set-Cookie headers
+                    new_at = None
+                    new_rt = None
+
+                    # aiohttp parses cookies into SimpleCookie
+                    if "xkaf_at" in resp.cookies:
+                        new_at = resp.cookies["xkaf_at"].value
+                    if "xkaf_rt" in resp.cookies:
+                        new_rt = resp.cookies["xkaf_rt"].value
+
+                    # Fallback regex if cookie jar didn't catch path-restricted cookies
+                    for header_val in resp.headers.getall("Set-Cookie", []):
+                        m_at = re.search(r"xkaf_at=([^;,\s]+)", header_val)
+                        if m_at and m_at.group(1) != "deleted":
+                            new_at = m_at.group(1)
+                        m_rt = re.search(r"xkaf_rt=([^;,\s]+)", header_val)
+                        if m_rt and m_rt.group(1) != "deleted":
+                            new_rt = m_rt.group(1)
+
+                    if new_at or new_rt:
+                        if new_at:
+                            xkaf_state["at"] = new_at
+                        if new_rt:
+                            xkaf_state["rt"] = new_rt
+                        xkaf_state["last_refresh"] = time.time()
+                        xkaf_state["status"] = "active"
+                        xkaf_state["last_error"] = None
+                        save_cached_session()
+                        print(f"[+] xKAF session refreshed successfully! Next rotation in 7m.")
+                        return True, "Session refreshed."
+                    else:
+                        print("[!] Warning: 200 OK received but no Set-Cookie headers found.")
+                        return True, "OK (no new cookies)"
+                elif status == 401:
+                    xkaf_state["status"] = "expired"
+                    xkaf_state["last_error"] = "HTTP 401 Unauthorized"
+                    print(f"[!] xKAF refresh failed with 401: token expired or invalidated.")
+                    return False, "Token expired (HTTP 401)"
+                else:
+                    xkaf_state["last_error"] = f"HTTP {status}"
+                    print(f"[!] xKAF refresh failed with HTTP {status}: {raw_text[:200]}")
+                    return False, f"HTTP {status}"
+    except Exception as e:
+        xkaf_state["last_error"] = str(e)
+        print(f"[!] Network error during xKAF refresh: {e}")
+        return False, str(e)
+
+async def mint_xkaf_token(raw_id=None, slug=None, msg_id=None, ext="epub"):
+    """Mints a signed 5-minute download token for raw or curated books."""
+    if not xkaf_state.get("at"):
+        # Attempt immediate refresh
+        ok, _ = await refresh_xkaf_session()
+        if not ok or not xkaf_state.get("at"):
+            return None, "xKAF session not active or expired. Please visit /set-session?rt=..."
+
+    payload = {}
+    if raw_id:
+        try:
+            payload["rawId"] = int(raw_id)
+        except ValueError:
+            payload["rawId"] = raw_id
+    else:
+        payload["bookSlug"] = slug or ""
+        try:
+            payload["telegramMsgId"] = int(msg_id or 0)
+        except ValueError:
+            payload["telegramMsgId"] = 0
+        payload["format"] = (ext or "epub").lower()
+
+    cookie_parts = []
+    if xkaf_state.get("at"):
+        cookie_parts.append(f"xkaf_at={xkaf_state['at']}")
+    if xkaf_state.get("rt"):
+        cookie_parts.append(f"xkaf_rt={xkaf_state['rt']}")
+
+    headers = {
+        "User-Agent": USER_AGENT,
+        "Referer": "https://xkaf.org/",
+        "Origin": "https://xkaf.org",
+        "Accept": "application/json, text/plain, */*",
+        "Accept-Encoding": "gzip, deflate",
+        "Content-Type": "application/json",
+        "Cookie": "; ".join(cookie_parts),
+    }
+
+    url = f"{API_BASE}/api/downloads/mint-token"
+    print(f"[*] Minting download token: {payload}...")
+
+    async with ClientSession() as session:
+        async with session.post(url, headers=headers, json=payload) as resp:
+            status = resp.status
+            if status == 401:
+                print("[!] Mint token returned 401. Refreshing session and retrying...")
+                ok, _ = await refresh_xkaf_session()
+                if ok:
+                    cookie_parts = []
+                    if xkaf_state.get("at"):
+                        cookie_parts.append(f"xkaf_at={xkaf_state['at']}")
+                    if xkaf_state.get("rt"):
+                        cookie_parts.append(f"xkaf_rt={xkaf_state['rt']}")
+                    headers["Cookie"] = "; ".join(cookie_parts)
+                    async with session.post(url, headers=headers, json=payload) as retry_resp:
+                        if retry_resp.status == 200:
+                            data = await retry_resp.json()
+                            return data.get("url"), None
+                        else:
+                            return None, f"Retry failed with HTTP {retry_resp.status}"
+                return None, "Session unauthorized"
+
+            if status == 200:
+                data = await resp.json()
+                bot_url = data.get("url")
+                print(f"[+] Successfully minted token URL: {bot_url}")
+                return bot_url, None
+            else:
+                raw = await resp.text()
+                return None, f"Mint token failed (HTTP {status}): {raw[:200]}"
+
+async def session_keeper_loop():
+    """Background task running every 7 minutes to continuously rotate xkaf_rt."""
+    print("[*] Started xKAF 24/7 background session keeper loop (7m interval).")
+    while True:
+        try:
+            if xkaf_state.get("rt"):
+                await refresh_xkaf_session()
+            else:
+                xkaf_state["status"] = "waiting_for_token"
+        except Exception as e:
+            print(f"[!] Session keeper error: {e}")
+        # Wait 7 minutes (420s) before next rotation
+        await asyncio.sleep(420)
 
 def parse_telegram_target(raw_input):
     """
@@ -127,6 +307,75 @@ def parse_telegram_target(raw_input):
     clean = s.split("&")[0].split("?")[0].strip()
     return "bot", "xkaf_bot", clean
 
+async def handle_health(request):
+    client = request.app.get("telegram_client")
+    is_auth = False
+    me = None
+    if client:
+        try:
+            is_auth = await client.is_user_authorized()
+            if is_auth:
+                me = await client.get_me()
+        except Exception as e:
+            print(f"[!] Error checking client authorization: {e}")
+
+    now = time.time()
+    last_ref = xkaf_state["last_refresh"]
+    age_seconds = int(now - last_ref) if last_ref > 0 else None
+
+    return web.json_response({
+        "status": "ok" if is_auth else "warning",
+        "telegram": {
+            "authorized": is_auth,
+            "user": me.first_name if me else None,
+            "username": me.username if me else None,
+            "phone": me.phone if me else None,
+        },
+        "xkaf_session": {
+            "status": xkaf_state["status"],
+            "has_token": bool(xkaf_state["rt"]),
+            "last_refresh_ago": f"{age_seconds}s" if age_seconds is not None else "never",
+            "last_error": xkaf_state["last_error"],
+        },
+        "service": "xkaf-telegram-relay",
+        "notice": None if is_auth else "Telegram client not yet authorized. Please verify TELEGRAM_STRING_SESSION.",
+    })
+
+async def handle_set_session(request):
+    """Allows one-time or manual configuration of xkaf_rt."""
+    rt = request.query.get("rt") or request.query.get("token")
+    if not rt and request.can_read_body:
+        try:
+            body = await request.json()
+            rt = body.get("rt") or body.get("token") or body.get("xkaf_rt")
+        except Exception:
+            pass
+
+    if not rt:
+        return web.json_response({
+            "error": "Missing 'rt' parameter. Usage: /set-session?rt=YOUR_XKAF_RT",
+            "current_status": xkaf_state["status"]
+        }, status=400)
+
+    # Clean token string
+    clean_rt = rt.strip().strip('"\'')
+    if "xkaf_rt=" in clean_rt:
+        m = re.search(r"xkaf_rt=([^;,\s]+)", clean_rt)
+        if m:
+            clean_rt = m.group(1)
+
+    xkaf_state["rt"] = clean_rt
+    save_cached_session()
+    print(f"[*] Updated xKAF refresh token via /set-session. Testing refresh...")
+
+    ok, msg = await refresh_xkaf_session()
+    return web.json_response({
+        "status": "success" if ok else "warning",
+        "session_active": ok,
+        "message": msg,
+        "rotation_interval": "every 7 minutes automatically",
+    })
+
 async def handle_download(request):
     client = request.app.get("telegram_client")
     if not client or not await client.is_user_authorized():
@@ -139,62 +388,78 @@ async def handle_download(request):
     title = request.query.get("title", "book")
     ext = request.query.get("format", "epub").lower()
     raw_input = request.query.get("url") or request.query.get("link") or request.query.get("token")
+    raw_id = request.query.get("raw_id") or request.query.get("rawId")
     msg_id = request.query.get("msg_id") or request.query.get("telegram_msg_id")
+    slug = request.query.get("slug")
     channel = request.query.get("channel", "xkaforg")
 
-    # If explicit msg_id provided, fetch directly from channel
-    if msg_id:
+    # 1. If raw_id is passed, mint token using our 24/7 server session
+    if raw_id:
+        print(f"[*] Download request for Global Archive rawId: {raw_id} ('{title}')")
+        minted_url, err = await mint_xkaf_token(raw_id=raw_id, ext=ext)
+        if minted_url:
+            raw_input = minted_url
+        else:
+            return web.Response(
+                text=json.dumps({"error": f"Failed to mint download token for rawId #{raw_id}: {err}"}),
+                status=502,
+                content_type="application/json"
+            )
+
+    # 2. If slug is passed without explicit token/url, mint token using our 24/7 server session
+    elif slug and not raw_input and (not msg_id or msg_id == "0"):
+        print(f"[*] Download request for curated slug: {slug} ('{title}')")
+        minted_url, err = await mint_xkaf_token(slug=slug, msg_id=msg_id, ext=ext)
+        if minted_url:
+            raw_input = minted_url
+        else:
+            return web.Response(
+                text=json.dumps({"error": f"Failed to mint download token for slug '{slug}': {err}"}),
+                status=502,
+                content_type="application/json"
+            )
+
+    # 3. Direct channel message fetch if msg_id provided and no raw_input
+    elif msg_id and not raw_input:
         try:
             mid = int(str(msg_id).strip())
-            print(f"[*] Direct Telegram fetch: channel '{channel}', msg_id {mid} for '{title}' ({ext})")
-            msg = await client.get_messages(channel, ids=mid)
-            if msg and msg.file:
-                print(f"[+] Found document in {channel}/{mid}: {msg.file.name}")
-                file_bytes = await client.download_media(msg, file=bytes)
-                if file_bytes:
-                    file_name = msg.file.name or f"{title}.{ext}"
-                    print(f"[+] Streamed '{file_name}' ({len(file_bytes)} bytes) directly to client.")
-                    response = web.Response(body=file_bytes)
-                    response.content_type = "application/epub+zip" if ext == "epub" else "application/octet-stream"
-                    response.headers["Content-Disposition"] = f'attachment; filename="{file_name}"'
-                    response.headers["Content-Length"] = str(len(file_bytes))
-                    return response
-            else:
-                print(f"[!] Message {mid} in {channel} has no document attached.")
+            if mid > 0:
+                print(f"[*] Direct Telegram fetch: channel '{channel}', msg_id {mid} for '{title}' ({ext})")
+                msg = await client.get_messages(channel, ids=mid)
+                if msg and msg.file:
+                    file_bytes = await client.download_media(msg, file=bytes)
+                    if file_bytes:
+                        file_name = msg.file.name or f"{title}.{ext}"
+                        print(f"[+] Streamed '{file_name}' ({len(file_bytes)} bytes) directly to client.")
+                        response = web.Response(body=file_bytes)
+                        response.content_type = "application/epub+zip" if ext == "epub" else "application/octet-stream"
+                        response.headers["Content-Disposition"] = f'attachment; filename="{file_name}"'
+                        response.headers["Content-Length"] = str(len(file_bytes))
+                        return response
         except Exception as e:
-            print(f"[!] Error fetching direct message {msg_id}: {e}")
+            print(f"[!] Direct channel fetch fallback: {e}")
+
+        # If direct channel post had no file, fall back to minting with slug
+        if slug:
+            print(f"[*] Falling back to mint-token with slug '{slug}'...")
+            minted_url, _ = await mint_xkaf_token(slug=slug, msg_id=msg_id, ext=ext)
+            if minted_url:
+                raw_input = minted_url
 
     # Parse input link or token
     target_type, target_name, payload = parse_telegram_target(raw_input)
 
     if not target_type or not payload:
         return web.Response(
-            text=json.dumps({"error": "Missing valid Telegram link, token, or message ID."}),
+            text=json.dumps({"error": "Missing valid Telegram link, token, raw_id, or book slug."}),
             status=400,
             content_type="application/json"
         )
 
-    # If the link is a direct channel message (e.g. t.me/xkaforg/123)
-    if target_type == "channel":
-        try:
-            print(f"[*] Fetching from channel '{target_name}', msg_id {payload}...")
-            msg = await client.get_messages(target_name, ids=int(payload))
-            if msg and msg.file:
-                file_bytes = await client.download_media(msg, file=bytes)
-                if file_bytes:
-                    file_name = msg.file.name or f"{title}.{ext}"
-                    response = web.Response(body=file_bytes)
-                    response.content_type = "application/epub+zip" if ext == "epub" else "application/octet-stream"
-                    response.headers["Content-Disposition"] = f'attachment; filename="{file_name}"'
-                    response.headers["Content-Length"] = str(len(file_bytes))
-                    return response
-        except Exception as e:
-            print(f"[!] Error fetching channel message: {e}")
-
     # If the target is a bot (@xkaf_bot or @xKAF_dl_bot)
     bot_username = target_name or "xkaf_bot"
     token = str(payload).strip()
-    print(f"[*] Received download request for: '{title}' ({ext}) via @{bot_username} with token: {token}")
+    print(f"[*] Forwarding to Telegram: '{title}' ({ext}) via @{bot_username} with token: {token}")
 
     loop = asyncio.get_running_loop()
     doc_future = loop.create_future()
@@ -288,6 +553,8 @@ async def init_app():
     app.router.add_get("/", handle_health)
     app.router.add_get("/health", handle_health)
     app.router.add_get("/download", handle_download)
+    app.router.add_get("/set-session", handle_set_session)
+    app.router.add_post("/set-session", handle_set_session)
     app.router.add_post("/notify", handle_notify)
     app.router.add_get("/notify", handle_notify)
     return app
@@ -318,7 +585,10 @@ async def main():
     cfg = load_config()
     port = int(cfg.get("port", 8080))
 
-    # 1. Start the HTTP web server FIRST so container health checks always pass
+    # Load initial session from disk or env
+    load_cached_session()
+
+    # 1. Start the HTTP web server FIRST
     app = await init_app()
     runner = web.AppRunner(app)
     await runner.setup()
@@ -326,8 +596,9 @@ async def main():
     await site.start()
 
     print("\n" + "="*60)
-    print(f"  xKAF Telegram Relay web server listening on port {port}!")
+    print(f"  xKAF Telegram Relay & Session Keeper listening on port {port}!")
     print(f"  Health Check: http://0.0.0.0:{port}/health")
+    print(f"  Set Session:  http://0.0.0.0:{port}/set-session?rt=...")
     print("="*60 + "\n")
 
     # 2. Connect Telegram Client
@@ -360,6 +631,9 @@ async def main():
         print("[!] No TELEGRAM_STRING_SESSION provided in environment variables.")
 
     app["telegram_client"] = client
+
+    # 3. Start 24/7 background session keeper loop
+    asyncio.create_task(session_keeper_loop())
 
     # Keep server running forever
     while True:
