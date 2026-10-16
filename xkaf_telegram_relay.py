@@ -433,9 +433,8 @@ async def handle_download(request):
     slug = request.query.get("slug")
     channel = request.query.get("channel", "xkaforg")
 
-    is_raw_book = bool(raw_id)
-    # Global Archive uses @xKAF_dl_bot; Curated Library uses @xkaf_bot
-    default_bot = "xKAF_dl_bot" if is_raw_book else "xkaf_bot"
+    # @xKAF_dl_bot is the real download delivery bot for both Curated and Global Archive
+    default_bot = "xKAF_dl_bot"
 
     # 1. If raw_id is passed, mint token using our 24/7 server session
     if raw_id:
@@ -539,14 +538,13 @@ async def handle_download(request):
             print(f"[-] Ignored bot welcome photo from @{sender_chat} ({event.message.file.size if event.message.file else 0} bytes). Waiting for book document...")
 
     try:
-        # Send /start {token} to primary bot
-        print(f"[*] Sending '/start {token}' to primary bot @{bot_username}...")
-        await client.send_message(bot_username, f"/start {token}")
+        # Send /start {token} directly to @xKAF_dl_bot (the real book downloader)
+        print(f"[*] Sending '/start {token}' to @xKAF_dl_bot...")
+        await client.send_message("xKAF_dl_bot", f"/start {token}")
 
-        # For raw books, if primary was not xKAF_dl_bot, also send to xKAF_dl_bot
-        if is_raw_book and bot_username != "xKAF_dl_bot":
-            print(f"[*] Also sending '/start {token}' to @xKAF_dl_bot...")
-            await client.send_message("xKAF_dl_bot", f"/start {token}")
+        if bot_username and bot_username != "xKAF_dl_bot":
+            print(f"[*] Also sending '/start {token}' to @{bot_username}...")
+            await client.send_message(bot_username, f"/start {token}")
 
         # Wait for file with 45s timeout
         msg = await asyncio.wait_for(doc_future, timeout=45.0)
