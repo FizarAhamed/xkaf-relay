@@ -182,11 +182,44 @@ async def handle_download(request):
     response.headers["Content-Length"] = str(len(file_bytes))
     return response
 
+async def handle_notify(request):
+    client = request.app.get("telegram_client")
+    if not client or not await client.is_user_authorized():
+        return web.json_response({"error": "Telegram client not authorized."}, status=401)
+
+    try:
+        if request.can_read_body:
+            body = await request.json()
+        else:
+            body = {}
+    except Exception:
+        body = {}
+
+    text = body.get("message") or body.get("text") or request.query.get("text")
+    if not text:
+        return web.json_response({"error": "Missing message text"}, status=400)
+
+    target = body.get("target") or request.query.get("target") or "me"
+
+    try:
+        sent = await client.send_message(target, text)
+        return web.json_response({
+            "status": "success",
+            "message_id": sent.id,
+            "target": str(target),
+            "recipient": "Saved Messages" if target == "me" else str(target),
+        })
+    except Exception as e:
+        print(f"[!] Error sending notification: {e}")
+        return web.json_response({"error": str(e)}, status=500)
+
 async def init_app():
     app = web.Application()
     app.router.add_get("/", handle_health)
     app.router.add_get("/health", handle_health)
     app.router.add_get("/download", handle_download)
+    app.router.add_post("/notify", handle_notify)
+    app.router.add_get("/notify", handle_notify)
     return app
 
 async def interactive_login(client):
