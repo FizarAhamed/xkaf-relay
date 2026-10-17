@@ -340,7 +340,7 @@ async def handle_health(request):
         "bots": {
             "all_downloads": "@xKAF_dl_bot",
         },
-        "version": "1.3.0-dlbot-fix",
+        "version": "1.4.0-tg-commands",
         "service": "xkaf-telegram-relay",
         "notice": None if is_auth else "Telegram client not yet authorized. Please verify TELEGRAM_STRING_SESSION.",
     })
