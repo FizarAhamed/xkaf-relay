@@ -440,36 +440,9 @@ async def handle_download(request):
     # @xKAF_dl_bot is the real download delivery bot for both Curated and Global Archive
     default_bot = "xKAF_dl_bot"
 
-    # 1. If raw_id is passed, mint token using our 24/7 server session
-    if raw_id:
-        print(f"[*] Download request for Global Archive rawId: {raw_id} ('{title}')")
-        minted_url, err = await mint_xkaf_token(raw_id=raw_id, ext=ext)
-        if minted_url:
-            raw_input = minted_url
-            print(f"[+] Global Archive minted URL: {minted_url}")
-        else:
-            return web.Response(
-                text=json.dumps({"error": f"Failed to mint download token for rawId #{raw_id}: {err}"}),
-                status=502,
-                content_type="application/json"
-            )
-
-    # 2. If slug is passed without explicit token/url, mint token using our 24/7 server session
-    elif slug and not raw_input:
-        print(f"[*] Download request for curated slug: {slug} ('{title}')")
-        minted_url, err = await mint_xkaf_token(slug=slug, msg_id=msg_id, ext=ext)
-        if minted_url:
-            raw_input = minted_url
-            print(f"[+] Curated book minted URL: {minted_url}")
-        else:
-            return web.Response(
-                text=json.dumps({"error": f"Failed to mint download token for slug '{slug}': {err}"}),
-                status=502,
-                content_type="application/json"
-            )
-
-    # 3. Direct channel message fetch if msg_id provided and no raw_input
-    elif msg_id and not raw_input:
+    # 1. Direct channel message fetch if msg_id provided and not raw_id and not raw_input
+    # (Curated library has 1,280 books in channel @xkaforg - 100% session-free!)
+    if msg_id and not raw_id and not raw_input:
         try:
             mid = int(str(msg_id).strip())
             if mid > 0:
@@ -485,15 +458,38 @@ async def handle_download(request):
                         response.headers["Content-Disposition"] = f'attachment; filename="{file_name}"'
                         response.headers["Content-Length"] = str(len(file_bytes))
                         return response
+                else:
+                    print(f"[*] Direct channel msg {mid} had no document, falling back...")
         except Exception as e:
             print(f"[!] Direct channel fetch fallback: {e}")
 
-        # If direct channel post had no file, fall back to minting with slug
-        if slug:
-            print(f"[*] Falling back to mint-token with slug '{slug}'...")
-            minted_url, _ = await mint_xkaf_token(slug=slug, msg_id=msg_id, ext=ext)
-            if minted_url:
-                raw_input = minted_url
+    # 2. If raw_id is passed, mint token using our 24/7 server session (Global Archive)
+    if raw_id:
+        print(f"[*] Download request for Global Archive rawId: {raw_id} ('{title}')")
+        minted_url, err = await mint_xkaf_token(raw_id=raw_id, ext=ext)
+        if minted_url:
+            raw_input = minted_url
+            print(f"[+] Global Archive minted URL: {minted_url}")
+        else:
+            return web.Response(
+                text=json.dumps({"error": f"Failed to mint download token for rawId #{raw_id}: {err}"}),
+                status=502,
+                content_type="application/json"
+            )
+
+    # 3. If slug is passed without explicit token/url (fallback for curated books if direct fetch didn't return a doc)
+    elif slug and not raw_input:
+        print(f"[*] Download request for curated slug: {slug} ('{title}')")
+        minted_url, err = await mint_xkaf_token(slug=slug, msg_id=msg_id, ext=ext)
+        if minted_url:
+            raw_input = minted_url
+            print(f"[+] Curated book minted URL: {minted_url}")
+        else:
+            return web.Response(
+                text=json.dumps({"error": f"Failed to mint download token for slug '{slug}': {err}"}),
+                status=502,
+                content_type="application/json"
+            )
 
     # Parse input link or token with appropriate default bot
     target_type, target_name, payload = parse_telegram_target(raw_input, default_bot=default_bot)
@@ -639,6 +635,80 @@ async def init_app():
     app.router.add_get("/notify", handle_notify)
     return app
 
+def register_telegram_commands(client):
+    """Registers automated bot command handlers in the user's private Telegram Saved Messages."""
+    if not client:
+        return
+
+    @client.on(events.NewMessage(chats="me"))
+    async def handle_saved_messages(event):
+        text = (event.message.text or "").strip()
+        if not text:
+            return
+
+        # 1. /rt <token> or /rt=<token> or rt=<token>
+        match = re.match(r"(?i)^(?:/rt|rt)(?:\s+|=)(.+)$", text)
+        if match:
+            raw_token = match.group(1).strip()
+            # Clean possible cookie wrapper e.g. xkaf_rt=...
+            m_rt = re.search(r"xkaf_rt=([^;\s]+)", raw_token)
+            clean_rt = m_rt.group(1) if m_rt else raw_token.split(";")[0].strip()
+
+            xkaf_state["rt"] = clean_rt
+            save_cached_session()
+            print(f"[*] Updated xKAF refresh token via Telegram command: {clean_rt[:10]}...")
+
+            ok, err = await refresh_xkaf_session()
+            if ok:
+                user = xkaf_state.get("user_info") or "Active Member"
+                await event.reply(
+                    f"✅ **xKAF Session Updated Successfully!**\n\n"
+                    f"• **Status:** Active & Verified\n"
+                    f"• **Member:** {user}\n"
+                    f"• **Token:** `{clean_rt[:8]}...{clean_rt[-6:]}`\n"
+                    f"• **Auto-Renewal:** Every 7 minutes 🔄\n\n"
+                    f"You can now download from Global Archive on your Kindle!",
+                    parse_mode="md"
+                )
+            else:
+                await event.reply(
+                    f"❌ **Failed to verify token with xKAF:**\n`{err}`\n\n"
+                    f"Please make sure you are logged in on xkaf.org and copied a fresh `xkaf_rt`.",
+                    parse_mode="md"
+                )
+            return
+
+        # 2. /status or /session or /ping
+        if text.lower() in ["/status", "/session", "/ping"]:
+            rt_disp = f"`{xkaf_state['rt'][:8]}...`" if xkaf_state.get("rt") else "Not configured"
+            at_disp = f"`{xkaf_state['at'][:8]}...`" if xkaf_state.get("at") else "Not configured"
+            last_ref = time.strftime('%Y-%m-%d %H:%M:%S', time.localtime(xkaf_state['last_refresh'])) if xkaf_state.get('last_refresh') else "Never"
+            status_emoji = "🟢" if xkaf_state.get("status") == "active" else "🔴"
+
+            await event.reply(
+                f"📊 **xKAF Relay Server Status**\n\n"
+                f"• **Session:** {status_emoji} `{xkaf_state.get('status')}`\n"
+                f"• **Last Error:** `{xkaf_state.get('last_error') or 'None'}`\n"
+                f"• **Last Refresh:** {last_ref}\n"
+                f"• **RT Token:** {rt_disp}\n"
+                f"• **AT Token:** {at_disp}\n\n"
+                f"💡 Send `/rt <token>` anytime to update your session.\n"
+                f"📚 *Curated books (1,280 books) download directly from the channel without login!*",
+                parse_mode="md"
+            )
+            return
+
+        # 3. /help or /start
+        if text.lower() in ["/help", "/start"]:
+            await event.reply(
+                "🤖 **xKAF Kindle Relay Commands**\n\n"
+                "• `/rt <token>` — Update your xKAF refresh token\n"
+                "• `/status` — Check 24/7 session status & health\n\n"
+                "✨ *Curated books (1,280 books) download directly from the channel with 0 login required!*",
+                parse_mode="md"
+            )
+            return
+
 async def interactive_login(client):
     await client.connect()
     if not await client.is_user_authorized():
@@ -710,6 +780,14 @@ async def main():
         print("[!] No TELEGRAM_STRING_SESSION provided in environment variables.")
 
     app["telegram_client"] = client
+
+    if client:
+        try:
+            if await client.is_user_authorized():
+                register_telegram_commands(client)
+                print("[+] Telegram command listener registered for Saved Messages (/rt, /status, /help).")
+        except Exception as e:
+            print(f"[!] Could not register Telegram command listener: {e}")
 
     # 3. Start 24/7 background session keeper loop
     asyncio.create_task(session_keeper_loop())
